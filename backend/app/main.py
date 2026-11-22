@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ipaddress
+import logging
 import json
 import os
 import re
@@ -20,6 +21,8 @@ from fastapi.responses import FileResponse
 from openai import AsyncOpenAI
 from pydantic import BaseModel, field_validator
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+
+from app.egress import public_egress_proxy
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "./data")).resolve()
 ARTIFACTS = DATA_DIR / "artifacts"
@@ -131,11 +134,37 @@ async def analyze_failures(url: str, failures: list[dict[str, Any]], summary: di
     except Exception as exc:
         return {"status": "error", "summary": f"AI analysis failed: {type(exc).__name__}. Browser evidence is still available.", "recommendations": []}
 
+def _prune_run_rows(con: sqlite3.Connection) -> list[str]:
+    evicted = [
+        row["id"] for row in con.execute(
+            "SELECT id FROM runs ORDER BY created_at DESC, rowid DESC LIMIT -1 OFFSET ?",
+            (max(1, MAX_RUNS),),
+        ).fetchall()
+    ]
+    if evicted:
+        placeholders = ",".join("?" for _ in evicted)
+        con.execute(f"DELETE FROM runs WHERE id IN ({placeholders})", evicted)
+    return evicted
+
+
+def _remove_run_artifacts(run_ids: list[str]) -> None:
+    for run_id in run_ids:
+        # IDs are generated UUIDs; glob is constrained to that run's own PNG files.
+        for artifact in ARTIFACTS.glob(f"{run_id}-*.png"):
+            try:
+                artifact.unlink(missing_ok=True)
+            except OSError as exc:
+                logging.warning("Could not remove artifact %s: %s", artifact.name, exc)
+
+
 def persist(result: dict[str, Any]) -> None:
     with db() as con:
         con.execute("INSERT OR REPLACE INTO runs (id,url,status,created_at,completed_at,duration_ms,result_json,is_demo) VALUES (?,?,?,?,?,?,?,?)",
             (result["id"], result["url"], result["status"], result["started_at"], result.get("completed_at"), result.get("duration_ms"), json.dumps(result), int(result.get("is_demo", False))))
-        con.execute("DELETE FROM runs WHERE id IN (SELECT id FROM runs ORDER BY created_at DESC LIMIT -1 OFFSET ?)", (MAX_RUNS,))
+        evicted_ids = _prune_run_rows(con)
+    # Delete files only after the SQLite transaction commits. A filesystem error
+    # leaves an orphaned file, never a partially-pruned database transaction.
+    _remove_run_artifacts(evicted_ids)
 
 def read_run(run_id: str) -> dict[str, Any] | None:
     with db() as con:
@@ -154,77 +183,78 @@ async def run_browser_test(run_id: str, request: TestRequest) -> None:
         result["failures"].append({"category": category, "severity": severity, "title": title, "detail": detail, "url": link})
 
     try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            profiles = []
-            if request.desktop:
-                profiles.append(("desktop", {"viewport": {"width": 1440, "height": 900}, "device_scale_factor": 1}))
-            if request.mobile:
-                profiles.append(("mobile", {"viewport": {"width": 390, "height": 844}, "device_scale_factor": 1, "is_mobile": True, "has_touch": True}))
-            if not profiles:
-                profiles.append(("desktop", {"viewport": {"width": 1440, "height": 900}}))
-            for label, device in profiles:
-                context = await browser.new_context(**device)
-                page = await context.new_page()
-                page.set_default_timeout(15000)
-                async def guard_public_requests(route):
+        async with public_egress_proxy() as proxy_url:
+                async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True, proxy={"server": proxy_url, "bypass": "<-loopback>"})
+                profiles = []
+                if request.desktop:
+                    profiles.append(("desktop", {"viewport": {"width": 1440, "height": 900}, "device_scale_factor": 1}))
+                if request.mobile:
+                    profiles.append(("mobile", {"viewport": {"width": 390, "height": 844}, "device_scale_factor": 1, "is_mobile": True, "has_touch": True}))
+                if not profiles:
+                    profiles.append(("desktop", {"viewport": {"width": 1440, "height": 900}}))
+                for label, device in profiles:
+                    context = await browser.new_context(**device)
+                    page = await context.new_page()
+                    page.set_default_timeout(15000)
+                    async def guard_public_requests(route):
+                        try:
+                            safe_public_url(route.request.url)
+                        except ValueError:
+                            await route.abort()
+                        else:
+                            await route.continue_()
+                    await page.route("**/*", guard_public_requests)
+                    js_seen: list[dict[str, str]] = []
+                    http_seen: list[dict[str, Any]] = []
+                    page.on("pageerror", lambda error: js_seen.append({"type": "pageerror", "message": str(error)[:1000]}))
+                    page.on("console", lambda msg: js_seen.append({"type": "console", "message": msg.text[:1000]}) if msg.type == "error" else None)
+                    page.on("response", lambda response: http_seen.append({"status": response.status, "url": response.url, "resource_type": response.request.resource_type}) if response.status >= 400 else None)
                     try:
-                        safe_public_url(route.request.url)
-                    except ValueError:
-                        await route.abort()
-                    else:
-                        await route.continue_()
-                await page.route("**/*", guard_public_requests)
-                js_seen: list[dict[str, str]] = []
-                http_seen: list[dict[str, Any]] = []
-                page.on("pageerror", lambda error: js_seen.append({"type": "pageerror", "message": str(error)[:1000]}))
-                page.on("console", lambda msg: js_seen.append({"type": "console", "message": msg.text[:1000]}) if msg.type == "error" else None)
-                page.on("response", lambda response: http_seen.append({"status": response.status, "url": response.url, "resource_type": response.request.resource_type}) if response.status >= 400 else None)
-                try:
-                    response = await page.goto(request.url, wait_until="domcontentloaded", timeout=30000)
-                    await page.wait_for_timeout(1000)
-                    title = await page.title()
-                    final_url = page.url
-                    if response and response.status >= 400:
-                        fail("http", "critical", f"Main page returned HTTP {response.status}", final_url)
-                    if not title.strip():
-                        fail("content", "low", "Page has an empty document title", final_url)
-                    screenshot_path = None
-                    if request.capture_screenshot:
-                        screenshot_path = ARTIFACTS / f"{run_id}-{label}.png"
-                        await page.screenshot(path=str(screenshot_path), full_page=True, timeout=15000)
-                        result["screenshots"].append({"viewport": label, "path": screenshot_path.name, "url": f"/api/runs/{run_id}/artifacts/{screenshot_path.name}"})
-                    anchors = await page.locator("a[href]").evaluate_all("(els) => els.map(a => ({href:a.href, text:(a.innerText||a.getAttribute('aria-label')||'').trim().slice(0,160)}))")
-                    result["viewports"].append({"name": label, "width": device["viewport"]["width"], "height": device["viewport"]["height"], "title": title, "final_url": final_url, "http_status": response.status if response else None, "screenshot": screenshot_path.name if screenshot_path else None})
-                    result["javascript_errors"].extend([{"viewport": label, **item} for item in js_seen])
-                    result["http_errors"].extend([{"viewport": label, **item} for item in http_seen])
-                    record_resource_http_failures(fail, http_seen)
-                    if label == "desktop" and request.check_links:
-                        seen: set[str] = set()
-                        for anchor in anchors:
-                            href = anchor.get("href", "")
-                            if not href.startswith(("http://", "https://")) or href in seen:
-                                continue
-                            seen.add(href)
-                            if len(seen) > MAX_LINKS:
-                                break
-                            try:
-                                safe_public_url(href)
-                                link_response = await context.request.get(href, timeout=8000, max_redirects=0)
-                                item = {"url": href, "text": anchor.get("text", ""), "status": link_response.status, "ok": link_response.status < 400}
-                                result["links"].append(item)
-                                if not item["ok"]:
-                                    fail("broken_link", "high" if link_response.status >= 500 else "medium", f"Broken link (HTTP {link_response.status})", href, href)
-                            except Exception as exc:
-                                result["links"].append({"url": href, "text": anchor.get("text", ""), "status": None, "ok": False, "error": type(exc).__name__})
-                                fail("broken_link", "medium", "Link could not be verified", f"{href} ({type(exc).__name__})", href)
-                except PlaywrightTimeoutError:
-                    fail("navigation", "critical", f"{label.title()} page load timed out", request.url)
-                except Exception as exc:
-                    fail("navigation", "critical", f"{label.title()} browser test failed", f"{type(exc).__name__}: {str(exc)[:500]}")
-                finally:
-                    await context.close()
-            await browser.close()
+                        response = await page.goto(request.url, wait_until="domcontentloaded", timeout=30000)
+                        await page.wait_for_timeout(1000)
+                        title = await page.title()
+                        final_url = page.url
+                        if response and response.status >= 400:
+                            fail("http", "critical", f"Main page returned HTTP {response.status}", final_url)
+                        if not title.strip():
+                            fail("content", "low", "Page has an empty document title", final_url)
+                        screenshot_path = None
+                        if request.capture_screenshot:
+                            screenshot_path = ARTIFACTS / f"{run_id}-{label}.png"
+                            await page.screenshot(path=str(screenshot_path), full_page=True, timeout=15000)
+                            result["screenshots"].append({"viewport": label, "path": screenshot_path.name, "url": f"/api/runs/{run_id}/artifacts/{screenshot_path.name}"})
+                        anchors = await page.locator("a[href]").evaluate_all("(els) => els.map(a => ({href:a.href, text:(a.innerText||a.getAttribute('aria-label')||'').trim().slice(0,160)}))")
+                        result["viewports"].append({"name": label, "width": device["viewport"]["width"], "height": device["viewport"]["height"], "title": title, "final_url": final_url, "http_status": response.status if response else None, "screenshot": screenshot_path.name if screenshot_path else None})
+                        result["javascript_errors"].extend([{"viewport": label, **item} for item in js_seen])
+                        result["http_errors"].extend([{"viewport": label, **item} for item in http_seen])
+                        record_resource_http_failures(fail, http_seen)
+                        if label == "desktop" and request.check_links:
+                            seen: set[str] = set()
+                            for anchor in anchors:
+                                href = anchor.get("href", "")
+                                if not href.startswith(("http://", "https://")) or href in seen:
+                                    continue
+                                seen.add(href)
+                                if len(seen) > MAX_LINKS:
+                                    break
+                                try:
+                                    safe_public_url(href)
+                                    link_response = await context.request.get(href, timeout=8000, max_redirects=0)
+                                    item = {"url": href, "text": anchor.get("text", ""), "status": link_response.status, "ok": link_response.status < 400}
+                                    result["links"].append(item)
+                                    if not item["ok"]:
+                                        fail("broken_link", "high" if link_response.status >= 500 else "medium", f"Broken link (HTTP {link_response.status})", href, href)
+                                except Exception as exc:
+                                    result["links"].append({"url": href, "text": anchor.get("text", ""), "status": None, "ok": False, "error": type(exc).__name__})
+                                    fail("broken_link", "medium", "Link could not be verified", f"{href} ({type(exc).__name__})", href)
+                    except PlaywrightTimeoutError:
+                        fail("navigation", "critical", f"{label.title()} page load timed out", request.url)
+                    except Exception as exc:
+                        fail("navigation", "critical", f"{label.title()} browser test failed", f"{type(exc).__name__}: {str(exc)[:500]}")
+                    finally:
+                        await context.close()
+                await browser.close()
     except Exception as exc:
         fail("engine", "critical", "Browser engine failed", f"{type(exc).__name__}: {str(exc)[:500]}")
 
