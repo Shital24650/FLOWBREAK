@@ -71,14 +71,14 @@ Example request:
 
 - Keep `OPENAI_API_KEY` on the backend only.
 - Only test websites you own or have permission to assess.
-- URL validation rejects localhost, private, loopback, link-local and reserved targets. A production public service also needs infrastructure egress rules, authentication, rate limits and redirect destination checks. DNS rebinding and browser subresource requests need network-level egress controls for a hardened multi-tenant service.
+- Browser navigation, redirects, subresources, downloads and link checks use a local validating HTTP proxy. The proxy resolves each requested hostname, rejects the connection if any DNS answer is non-public, and opens the upstream socket to a vetted IP literal (connection pinning), preventing Chromium from independently resolving the target after validation. Redirects create new proxy connections and are checked again. Browser requests are configured not to bypass the proxy for loopback destinations. This is application-level connection-pinned egress enforcement, not an OS/container firewall: other backend code and any process that bypasses the proxy are not restricted. For public multi-tenant production deployments, additionally enforce outbound firewall/network-policy rules, authentication, quotas and abuse controls.
 - Link checking is bounded. Sites may block bots or require authentication; an HTTP failure is an observed response, not definitive proof of a user-visible defect.
 - Screenshots may contain personal data. Protect access and define retention.
 - No user authentication, team isolation, scheduled monitoring, durable queue, video recording or cross-browser matrix yet. One Render instance processes jobs in-process.
 
 ## Tests
 
-Backend: `cd backend && pytest -q`
+Backend: `cd backend && python -m playwright install --with-deps chromium && pytest -q`
 
 Frontend: `cd frontend && npm install && npm test && npm run build`
 
