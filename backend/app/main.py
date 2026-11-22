@@ -135,6 +135,14 @@ async def run_browser_test(run_id: str, request: TestRequest) -> None:
                 context = await browser.new_context(**device)
                 page = await context.new_page()
                 page.set_default_timeout(15000)
+                async def guard_public_requests(route):
+                    try:
+                        safe_public_url(route.request.url)
+                    except ValueError:
+                        await route.abort()
+                    else:
+                        await route.continue_()
+                await page.route("**/*", guard_public_requests)
                 js_seen: list[dict[str, str]] = []
                 http_seen: list[dict[str, Any]] = []
                 page.on("pageerror", lambda error: js_seen.append({"type": "pageerror", "message": str(error)[:1000]}))
@@ -171,7 +179,7 @@ async def run_browser_test(run_id: str, request: TestRequest) -> None:
                                 break
                             try:
                                 safe_public_url(href)
-                                link_response = await context.request.get(href, timeout=8000, max_redirects=3)
+                                link_response = await context.request.get(href, timeout=8000, max_redirects=0)
                                 item = {"url": href, "text": anchor.get("text", ""), "status": link_response.status, "ok": link_response.status < 400}
                                 result["links"].append(item)
                                 if not item["ok"]:
