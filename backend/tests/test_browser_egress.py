@@ -25,6 +25,7 @@ def test_chromium_cannot_bypass_proxy_for_loopback_targets():
                     browser = await p.chromium.launch(
                         headless=True,
                         proxy={"server": proxy, "bypass": "<-loopback>"},
+                        args=["--disable-quic", "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"],
                     )
                     page = await browser.new_page()
                     response = None
