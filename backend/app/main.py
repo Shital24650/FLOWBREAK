@@ -186,6 +186,7 @@ async def run_browser_test(run_id: str, request: TestRequest) -> None:
         async with public_egress_proxy() as proxy_url:
             async with async_playwright() as p:
                 browser = await p.chromium.launch(headless=True, proxy={"server": proxy_url, "bypass": "<-loopback>"})
+                link_client = await p.request.new_context(proxy={"server": proxy_url, "bypass": "<-loopback>"}) if request.check_links else None
                 profiles = []
                 if request.desktop:
                     profiles.append(("desktop", {"viewport": {"width": 1440, "height": 900}, "device_scale_factor": 1}))
@@ -240,7 +241,7 @@ async def run_browser_test(run_id: str, request: TestRequest) -> None:
                                     break
                                 try:
                                     safe_public_url(href)
-                                    link_response = await context.request.get(href, timeout=8000, max_redirects=0)
+                                    link_response = await link_client.get(href, timeout=8000, max_redirects=0)
                                     item = {"url": href, "text": anchor.get("text", ""), "status": link_response.status, "ok": link_response.status < 400}
                                     result["links"].append(item)
                                     if not item["ok"]:
@@ -254,6 +255,8 @@ async def run_browser_test(run_id: str, request: TestRequest) -> None:
                         fail("navigation", "critical", f"{label.title()} browser test failed", f"{type(exc).__name__}: {str(exc)[:500]}")
                     finally:
                         await context.close()
+                if link_client:
+                    await link_client.dispose()
                 await browser.close()
     except Exception as exc:
         fail("engine", "critical", "Browser engine failed", f"{type(exc).__name__}: {str(exc)[:500]}")
