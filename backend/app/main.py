@@ -185,7 +185,11 @@ async def run_browser_test(run_id: str, request: TestRequest) -> None:
     try:
         async with public_egress_proxy() as proxy_url:
             async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True, proxy={"server": proxy_url, "bypass": "<-loopback>"})
+                browser = await p.chromium.launch(
+                    headless=True,
+                    proxy={"server": proxy_url, "bypass": "<-loopback>"},
+                    args=["--disable-quic", "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"],
+                )
                 link_client = await p.request.new_context(proxy={"server": proxy_url, "bypass": "<-loopback>"}) if request.check_links else None
                 profiles = []
                 if request.desktop:
