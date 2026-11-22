@@ -245,7 +245,7 @@ async def run_browser_test(run_id: str, request: TestRequest) -> None:
                                     break
                                 try:
                                     safe_public_url(href)
-                                    link_response = await link_client.get(href, timeout=8000, max_redirects=0)
+                                    link_response = await link_client.get(href, timeout=8000, max_redirects=10)
                                     item = {"url": href, "text": anchor.get("text", ""), "status": link_response.status, "ok": link_response.status < 400}
                                     result["links"].append(item)
                                     if not item["ok"]:
