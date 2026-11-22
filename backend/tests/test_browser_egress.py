@@ -27,11 +27,13 @@ def test_chromium_cannot_bypass_proxy_for_loopback_targets():
                         proxy={"server": proxy, "bypass": "<-loopback>"},
                     )
                     page = await browser.new_page()
+                    response = None
                     try:
-                        await page.goto(f"http://127.0.0.1:{target_port}/", timeout=5000)
+                        response = await page.goto(f"http://127.0.0.1:{target_port}/", timeout=5000)
                     except Exception:
                         pass
                     await browser.close()
+            assert response is not None and response.status == 403, "Chromium did not receive the proxy's explicit private-target denial"
             assert reached is False, "Chromium reached a loopback target instead of using the egress proxy"
         finally:
             target.close()
