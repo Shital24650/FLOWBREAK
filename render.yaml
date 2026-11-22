@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: flowbreak-api
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    healthCheckPath: /health
+    envVars:
+      - key: DATA_DIR
+        value: /var/data
+      - key: CORS_ORIGINS
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-4o-mini
+    disk:
+      name: flowbreak-data
+      mountPath: /var/data
+      sizeGB: 1
