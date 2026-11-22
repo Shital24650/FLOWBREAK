@@ -184,7 +184,7 @@ async def run_browser_test(run_id: str, request: TestRequest) -> None:
 
     try:
         async with public_egress_proxy() as proxy_url:
-                async with async_playwright() as p:
+            async with async_playwright() as p:
                 browser = await p.chromium.launch(headless=True, proxy={"server": proxy_url, "bypass": "<-loopback>"})
                 profiles = []
                 if request.desktop:
