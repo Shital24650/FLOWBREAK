@@ -118,6 +118,7 @@ async def run_browser_test(run_id: str, request: TestRequest) -> None:
         "started_at": now(), "viewports": [], "failures": [], "links": [],
         "javascript_errors": [], "http_errors": [], "screenshots": [], "ai_analysis": None,
     }
+    persist(result)
     def fail(category: str, severity: str, title: str, detail: str, link: str | None = None) -> None:
         result["failures"].append({"category": category, "severity": severity, "title": title, "detail": detail, "url": link})
 
