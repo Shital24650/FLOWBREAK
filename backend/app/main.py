@@ -49,19 +49,50 @@ def safe_public_url(value: str) -> str:
     parsed = urlparse(value)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise ValueError("Only public http:// and https:// URLs are allowed.")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("URLs containing credentials are not allowed.")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("The target URL contains an invalid port.") from exc
+
     host = parsed.hostname.lower().rstrip(".")
-    if host in {"localhost", "localhost.localdomain"} or host.endswith((".local", ".internal", ".test")):
+    blocked_suffixes = (
+        ".local", ".internal", ".test", ".localhost", ".home.arpa",
+        ".lan", ".corp", ".invalid",
+    )
+    if host in {"localhost", "localhost.localdomain", "metadata.google.internal"} or host.endswith(blocked_suffixes):
         raise ValueError("Local and internal hosts are not allowed.")
+
     try:
         addresses = {ipaddress.ip_address(host)}
     except ValueError:
         try:
-            addresses = {ipaddress.ip_address(item[4][0]) for item in socket.getaddrinfo(host, None)}
-        except socket.gaierror as exc:
-            raise ValueError("The target hostname could not be resolved.") from exc
+            resolved = socket.getaddrinfo(
+                host, port or (443 if parsed.scheme == "https" else 80),
+                type=socket.SOCK_STREAM,
+            )
+            addresses = {ipaddress.ip_address(item[4][0].split("%", 1)[0]) for item in resolved}
+        except (OSError, ValueError) as exc:
+            raise ValueError("The target hostname could not be resolved safely.") from exc
+
     if not addresses or any(not addr.is_global for addr in addresses):
         raise ValueError("Private, loopback, link-local and reserved network targets are blocked.")
     return value
+
+
+def record_resource_http_failures(fail, http_seen: list[dict[str, Any]]) -> None:
+    """Record failed subresources; the main document is handled by page.goto."""
+    for item in http_seen:
+        if item.get("resource_type") == "document":
+            continue
+        fail(
+            "http",
+            "high" if item["status"] >= 500 else "medium",
+            f"HTTP {item['status']} resource error",
+            item["url"],
+            item["url"],
+        )
 
 class TestRequest(BaseModel):
     url: str
@@ -148,7 +179,7 @@ async def run_browser_test(run_id: str, request: TestRequest) -> None:
                 http_seen: list[dict[str, Any]] = []
                 page.on("pageerror", lambda error: js_seen.append({"type": "pageerror", "message": str(error)[:1000]}))
                 page.on("console", lambda msg: js_seen.append({"type": "console", "message": msg.text[:1000]}) if msg.type == "error" else None)
-                page.on("response", lambda response: http_seen.append({"status": response.status, "url": response.url}) if response.status >= 400 else None)
+                page.on("response", lambda response: http_seen.append({"status": response.status, "url": response.url, "resource_type": response.request.resource_type}) if response.status >= 400 else None)
                 try:
                     response = await page.goto(request.url, wait_until="domcontentloaded", timeout=30000)
                     await page.wait_for_timeout(1000)
@@ -167,8 +198,7 @@ async def run_browser_test(run_id: str, request: TestRequest) -> None:
                     result["viewports"].append({"name": label, "width": device["viewport"]["width"], "height": device["viewport"]["height"], "title": title, "final_url": final_url, "http_status": response.status if response else None, "screenshot": screenshot_path.name if screenshot_path else None})
                     result["javascript_errors"].extend([{"viewport": label, **item} for item in js_seen])
                     result["http_errors"].extend([{"viewport": label, **item} for item in http_seen])
-                    for item in http_seen:
-                        fail("http", "high" if item["status"] >= 500 else "medium", f"HTTP {item['status']} resource error", item["url"], item["url"])
+                    record_resource_http_failures(fail, http_seen)
                     if label == "desktop" and request.check_links:
                         seen: set[str] = set()
                         for anchor in anchors:
