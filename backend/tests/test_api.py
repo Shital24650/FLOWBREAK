@@ -146,14 +146,19 @@ def test_pruning_tolerates_missing_screenshot_artifacts(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "MAX_RUNS", 1)
     main.init_db()
 
-    for index in range(2):
+    run_ids = [str(uuid.uuid4()) for _ in range(2)]
+    for index, run_id in enumerate(run_ids):
         main.persist({
-            "id": str(uuid.uuid4()),
+            "id": run_id,
             "url": "https://example.com",
             "status": "passed",
             "started_at": f"2026-02-01T00:00:0{index}+00:00",
             "screenshots": [],
         })
+
+    with main.db() as con:
+        retained = [row["id"] for row in con.execute("SELECT id FROM runs")]
+    assert retained == [run_ids[1]]
 
 
 def test_artifact_cleanup_error_does_not_undo_database_pruning(tmp_path, monkeypatch, caplog):
