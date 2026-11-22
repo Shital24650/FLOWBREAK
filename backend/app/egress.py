@@ -15,8 +15,16 @@ def _public_ip(value: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
     address = ipaddress.ip_address(value.split("%", 1)[0])
     if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
         address = address.ipv4_mapped
-    if not address.is_global:
-        raise EgressDenied("The destination resolves to a non-public IP address.")
+    if (
+        not address.is_global
+        or address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_multicast
+        or address.is_reserved
+        or address.is_unspecified
+    ):
+        raise EgressDenied("The destination resolves to a non-public or special-use IP address.")
     return address
 
 
